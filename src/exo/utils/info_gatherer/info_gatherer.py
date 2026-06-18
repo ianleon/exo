@@ -4,11 +4,11 @@ import sys
 import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from subprocess import CalledProcessError
+from subprocess import PIPE, CalledProcessError
 from typing import Self, cast
 
 import anyio
-from anyio import fail_after, open_process, to_thread
+from anyio import EndOfStream, IncompleteRead, fail_after, open_process, to_thread
 from anyio.streams.buffered import BufferedByteReceiveStream
 from loguru import logger
 from pydantic import ValidationError
@@ -590,7 +590,9 @@ class InfoGatherer:
         # Timeout: if macmon produces no output for this many seconds, restart it.
         # macmon writes every macmon_interval seconds, so 10x that is generous.
         read_timeout = max(macmon_interval * 10, 30)
+        restart_delay = macmon_interval
         while True:
+            use_restart_backoff = False
             try:
                 async with await open_process(
                     [
@@ -598,25 +600,50 @@ class InfoGatherer:
                         "pipe",
                         "--interval",
                         str(macmon_interval * 1000),
-                    ]
+                    ],
+                    stderr=PIPE,
                 ) as p:
                     if not p.stdout:
                         logger.critical("MacMon closed stdout")
                         return
                     stream = BufferedByteReceiveStream(p.stdout)
                     while True:
-                        with fail_after(read_timeout):
-                            data = await stream.receive_until(
-                                delimiter=b"\n", max_bytes=8 * 1024
+                        try:
+                            with fail_after(read_timeout):
+                                data = await stream.receive_until(
+                                    delimiter=b"\n", max_bytes=8 * 1024
+                                )
+                                text = data.decode("utf-8", errors="replace").strip()
+                                metrics = MacmonMetrics.from_raw_json(text)
+                        except IncompleteRead:
+                            returncode = await p.wait()
+                            stderr_msg = "no stderr"
+                            if p.stderr is not None:
+                                try:
+                                    stderr_output = await p.stderr.receive(8 * 1024)
+                                except EndOfStream:
+                                    stderr_output = b""
+                                stderr_msg = (
+                                    stderr_output.decode(
+                                        "utf-8", errors="replace"
+                                    ).strip()
+                                    or "no stderr"
+                                )
+                            logger.warning(
+                                f"MacMon stream closed before a complete metrics line "
+                                f"with return code {returncode}: {stderr_msg}"
                             )
-                            text = data.decode("utf-8", errors="replace").strip()
-                            metrics = MacmonMetrics.from_raw_json(text)
+                            self._tg.start_soon(self._monitor_memory_usage, 1)
+                            use_restart_backoff = True
+                            break
                         await self.info_sender.send(metrics)
+                        restart_delay = macmon_interval
             except TimeoutError:
                 logger.warning(
                     f"MacMon produced no output for {read_timeout}s, restarting"
                 )
                 self._tg.start_soon(self._monitor_memory_usage, 1)
+                use_restart_backoff = True
             except CalledProcessError as e:
                 stderr_msg = "no stderr"
                 stderr_output = cast(bytes | str | None, e.stderr)
@@ -630,6 +657,7 @@ class InfoGatherer:
                     f"MacMon failed with return code {e.returncode}: {stderr_msg}"
                 )
                 self._tg.start_soon(self._monitor_memory_usage, 1)
+                use_restart_backoff = True
             except ProcessLookupError:
                 # usually throws by the process' context manager on exit
                 # when we ctrl+c, hence usually should be ignored;
@@ -638,7 +666,11 @@ class InfoGatherer:
                 logger.warning(
                     "Macmon process not found - shutting down macmon monitor"
                 )
+                use_restart_backoff = True
             except Exception as e:
                 logger.opt(exception=e).warning("Error in macmon monitor")
                 self._tg.start_soon(self._monitor_memory_usage, 1)
-            await anyio.sleep(macmon_interval)
+                use_restart_backoff = True
+            await anyio.sleep(restart_delay if use_restart_backoff else macmon_interval)
+            if use_restart_backoff:
+                restart_delay = min(restart_delay * 2, 60)
