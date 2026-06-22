@@ -170,6 +170,8 @@ This keeps side effects local and repeatable: the state says what should exist, 
 
 ## Placement and Downloads
 
+In this document, placement means the master's scheduling decision for where a model instance lives in the cluster and how that model is split across nodes. A placement maps model shards to runner ids and node ids. It is not software deployment; it is the cluster-level decision that says, for example, which node runs rank 0, which node runs rank 1, and which shard each runner should load.
+
 Placement is implemented in `src/exo/master/placement.py`. Given a `PlaceInstance` command, the master:
 
 - finds topology cycles with at least the requested number of nodes
